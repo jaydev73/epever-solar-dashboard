@@ -3,10 +3,17 @@ import time
 from flask import Flask, render_template_string, jsonify, redirect, url_for
 from pymodbus.client import ModbusTcpClient
 from pymodbus.framer import FramerType
-from dotenv import load_dotenv # <-- Import the environment loader
-# Load the keys out of your hidden local .env file
+from dotenv import load_dotenv
+
+# Load parameters securely out of your hidden .env file
 load_dotenv()
+import logging  # <-- Add this import at the top of your script
+
 app = Flask(__name__)
+
+# 🤫 SILENCE THE FLASK ENGINE ACCES LOGS
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)  # Only print lines if a serious system error crashes
 
 # CONFIGURATION (Pulled securely from environment variables)
 DONGLE_IP = os.getenv("EPEVER_DONGLE_IP")
@@ -18,21 +25,32 @@ def fetch_mppt_data():
     if not client.connect():
         return None
     try:
-        # Wake up frame for the dongle hardware
+        # Wake up frame for the EPEVER network dongle 
         client.socket.send(bytes.fromhex("20020000"))
         time.sleep(0.2)
         
         # Read Live telemetry (18 registers starting at 0x3100)
         rt_result = client.read_input_registers(address=12544, count=18, device_id=DEVICE_ID)
-        # Read History metrics (2 registers starting at 0x3312)
+        
+        # Read Charging Equipment Status Register (1 register at 0x3201 / 12801)
+        status_result = client.read_input_registers(address=12801, count=1, device_id=DEVICE_ID)
+        
+        # Read History metrics (2 registers starting at 0x3312 / 13074)
         stats_result = client.read_input_registers(address=13074, count=2, device_id=DEVICE_ID)
         
-        if rt_result.isError() or stats_result.isError():
+        if rt_result.isError() or status_result.isError() or stats_result.isError():
             return None
             
         rt = rt_result.registers
+        status_reg = status_result.registers
         stats = stats_result.registers
         
+        # 🛡️ DIAGNOSTIC SAFETY BOUNDS CHECK
+        # This prevents the 'list index out of range' crash if an array returns short
+        if len(rt) < 18 or len(status_reg) < 1 or len(stats) < 2:
+            print(f"⚠️ Warning: Short packet received. rt={len(rt)}, status={len(status_reg)}, stats={len(stats)}")
+            return None
+
         pv_v = rt[0] / 100.0  
         pv_a = rt[1] / 100.0  
         pv_w = pv_v * pv_a
@@ -49,11 +67,17 @@ def fetch_mppt_data():
         battery_temp = rt[17] / 100.0
         total_kwh = (stats[0] | (stats[1] << 16)) / 100.0
 
-        status_raw = rt[10]
-        if status_raw == 0x01: mppt_state = "BULK CHARGE 🚀"
-        elif status_raw == 0x02: mppt_state = "BOOST/ABSORPTION ⚡"
-        elif status_raw == 0x03: mppt_state = "FLOAT MAINTENANCE 💤"
-        else: mppt_state = "PV HARVEST ACTIVE ☀️" if pv_w > 5.0 else "NIGHT / IDLE 🌙"
+        # Extract bits D3-D2 out of register 0x3201
+        charge_bits = (status_reg[0] >> 2) & 0x03
+        
+        if charge_bits == 0x01:
+            mppt_state = "FLOAT MAINTENANCE 💤"
+        elif charge_bits == 0x02:
+            mppt_state = "BOOST / ABSORPTION ⚡"
+        elif charge_bits == 0x03:
+            mppt_state = "EQUALIZATION CHARGE 🔥"
+        else:
+            mppt_state = "BULK CHARGE 🚀" if pv_w > 8.0 else "IDLE / NIGHT 🌙"
 
         return {
             "state": mppt_state, "v_pv": pv_v, "w_pv": pv_w,
@@ -62,7 +86,7 @@ def fetch_mppt_data():
             "total_kwh": total_kwh, "v_load": load_v, "a_load": load_a, "w_load": load_w
         }
     except Exception as e:
-        print(f"Extraction error: {e}")
+        print(f"Modbus Telemetry Error: {e}")
         return None
     finally:
         client.close()
@@ -75,12 +99,10 @@ def toggle_mppt_load(state_to_set):
     try:
         client.socket.send(bytes.fromhex("20020000"))
         time.sleep(0.2)
-        
-        # write_coil maps to register address 2 to override load states
         result = client.write_coil(address=2, value=state_to_set, device_id=DEVICE_ID)
         return not result.isError()
     except Exception as e:
-        print(f"Failed to transmit coil switch configuration: {e}")
+        print(f"Coil mutation transmission failure: {e}")
         return False
     finally:
         client.close()
@@ -109,7 +131,7 @@ WEB_UI = """
 </head>
 <body>
     <h1>Solar Controller Interactive Panel</h1>
-    <p id="mppt_state">CHARGER STATE: LOADING...</p>
+    <h2 id="mppt_state" style="color: #ffeb3b;">CHARGER STATE: LOADING...</h2>
 
     <div class="control-panel">
         <h3>12V DC Output Load Control</h3>
@@ -123,6 +145,8 @@ WEB_UI = """
         <div class="card"><div class="label">PV Power</div><div class="value" id="pv_w">-- W</div></div>
         <div class="card"><div class="label">Battery Voltage</div><div class="value" id="bat_v">-- V</div></div>
         <div class="card"><div class="label">Load Power</div><div class="value" id="load_w">-- W</div></div>
+        <div class="card"><div class="label">Controller Temp</div><div class="value" id="c_temp">-- °C</div></div>
+        <div class="card"><div class="label">Total Generated</div><div class="value" id="total_gen">-- kWh</div></div>
     </div>
 
     <script>
@@ -136,6 +160,8 @@ WEB_UI = """
                 document.getElementById('pv_w').innerText = data.w_pv.toFixed(1) + " W";
                 document.getElementById('bat_v').innerText = data.v_bat.toFixed(2) + " V";
                 document.getElementById('load_w').innerText = data.w_load.toFixed(1) + " W";
+                document.getElementById('c_temp').innerText = data.device_t.toFixed(1) + " °C";
+                document.getElementById('total_gen').innerText = data.total_kwh.toFixed(2) + " kWh";
                 
                 if(data.v_load > 2.0) {
                     document.getElementById('load_status').innerHTML = 'Load State: <span style="color:#04d361;">ON 🟢</span> (' + data.a_load.toFixed(2) + ' A)';
@@ -144,7 +170,7 @@ WEB_UI = """
                 }
             } catch(e) { console.error("Telemetry link lost"); }
         }
-        setInterval(updateTelemetry, 2000);
+        setInterval(updateTelemetry, 2500);
         updateTelemetry();
     </script>
 </body>
