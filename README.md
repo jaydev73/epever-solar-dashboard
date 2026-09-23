@@ -1,6 +1,6 @@
 # EPEVER Tracer 3210AN MPPT Solar Dashboard
 
-## 📊 Interface Preview
+## 📊 Interface Sample Preview
 ![Dashboard Preview](assets/epever_dashboard.png)
 
 A lightweight, local Python-based monitoring and control utility for the **EPEVER Tracer 3210AN MPPT Solar Charge Controller** using the **EPEVER Wi-Fi 2.4G RJ45 D** dongle. 
